@@ -69,6 +69,8 @@ private:
 
     std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::LaserScan>> scan_filter_sub_;
     std::shared_ptr<tf2_ros::MessageFilter<sensor_msgs::msg::LaserScan >> scan_filter_;
+    // 【补丁】直连 /scan 订阅，替代会自死锁的 tf2_ros::MessageFilter 路径
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr sub_;
     std::shared_ptr<tf2_ros::TransformBroadcaster> tfB_;
 
     GMapping::GridSlamProcessor* gsp_;
@@ -90,6 +92,9 @@ private:
     nav_msgs::msg::OccupancyGrid map_;
 
     tf2::Duration map_update_interval_;
+    // 【补丁】原版是 laserCallback 里的局部变量，每次回调都归零，
+    // 导致地图发布节流完全失效（updateMap 每次扫描都跑一遍全轨迹重算）。
+    tf2::TimePoint last_map_update_;
     tf2::Transform map_to_odom_;
     std::mutex map_to_odom_mutex_;
     std::mutex map_mutex_;

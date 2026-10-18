@@ -65,6 +65,7 @@ void SlamGmapping::init() {
     transform_publish_period_ = 0.05;
 
     map_update_interval_ = tf2::durationFromSec(0.5);
+    last_map_update_ = tf2::TimePointZero;
     maxUrange_ = 80.0;  maxRange_ = 0.0;
     minimum_score_ = 0;
     sigma_ = 0.05;
@@ -95,20 +96,109 @@ void SlamGmapping::init() {
     lasamplerange_ = 0.005;
     lasamplestep_ = 0.005;
     tf_delay_ = transform_publish_period_;
+
+    // ------------------------------------------------------------------
+    // 【补丁】读取 ROS 参数，覆盖上面的编译期默认值。
+    // 原版这里一行读参数的代码都没有，导致 params/slam_gmapping.yaml 完全不生效。
+    // declare_parameter 会自动应用 --params-file 里的同名值。
+    // ------------------------------------------------------------------
+    auto dparam = [this](const std::string & name, double & value) {
+        if (!this->has_parameter(name)) {
+            this->declare_parameter(name, value);
+        }
+        this->get_parameter(name, value);
+    };
+    auto iparam = [this](const std::string & name, int & value) {
+        if (!this->has_parameter(name)) {
+            this->declare_parameter(name, value);
+        }
+        this->get_parameter(name, value);
+    };
+    auto sparam = [this](const std::string & name, std::string & value) {
+        if (!this->has_parameter(name)) {
+            this->declare_parameter(name, value);
+        }
+        this->get_parameter(name, value);
+    };
+
+    // 坐标系
+    sparam("base_frame", base_frame_);
+    sparam("map_frame", map_frame_);
+    sparam("odom_frame", odom_frame_);
+
+    // 距离 / 角度更新阈值：越小 = 越频繁地做扫描匹配（更不容易漂）
+    dparam("linearUpdate", linearUpdate_);
+    dparam("angularUpdate", angularUpdate_);
+    dparam("temporalUpdate", temporalUpdate_);
+    dparam("resampleThreshold", resampleThreshold_);
+
+    // 粒子滤波与扫描匹配
+    iparam("particles", particles_);
+    iparam("iterations", iterations_);
+    iparam("kernelSize", kernelSize_);
+    iparam("lskip", lskip_);
+    dparam("sigma", sigma_);
+    dparam("lsigma", lsigma_);
+    dparam("ogain", ogain_);
+    dparam("lstep", lstep_);
+    dparam("astep", astep_);
+    dparam("llsamplerange", llsamplerange_);
+    dparam("llsamplestep", llsamplestep_);
+    dparam("lasamplerange", lasamplerange_);
+    dparam("lasamplestep", lasamplestep_);
+    dparam("minimum_score", minimum_score_);
+
+    // 运动模型噪声：odom 越准就设得越小（越相信里程计）
+    dparam("srr", srr_);
+    dparam("srt", srt_);
+    dparam("str", str_);
+    dparam("stt", stt_);
+
+    // 地图网格
+    dparam("delta", delta_);
+    dparam("xmin", xmin_);
+    dparam("ymin", ymin_);
+    dparam("xmax", xmax_);
+    dparam("ymax", ymax_);
+    dparam("occ_thresh", occ_thresh_);
+
+    // 激光使用范围（<=0 表示交给 initMapper 用激光器 range_max 自动决定）
+    dparam("maxRange", maxRange_);
+    dparam("maxUrange", maxUrange_);
+
+    // 其他
+    {
+        double v = tf2::durationToSec(map_update_interval_);
+        dparam("map_update_interval", v);
+        map_update_interval_ = tf2::durationFromSec(v);
+    }
+    dparam("transform_publish_period", transform_publish_period_);
+    tf_delay_ = transform_publish_period_;
+    iparam("throttle_scans", throttle_scans_);
+
+    RCLCPP_INFO(this->get_logger(),
+                "Loaded params: particles=%d linearUpdate=%.3f angularUpdate=%.3f "
+                "temporalUpdate=%.2f maxRange=%.2f maxUrange=%.2f delta=%.3f "
+                "srr=%.3f srt=%.3f str=%.3f stt=%.3f iterations=%d map_update_interval=%.2f",
+                particles_, linearUpdate_, angularUpdate_, temporalUpdate_,
+                maxRange_, maxUrange_, delta_, srr_, srt_, str_, stt_,
+                iterations_, tf2::durationToSec(map_update_interval_));
 }
 
 void SlamGmapping::startLiveSlam() {
     entropy_publisher_ = this->create_publisher<std_msgs::msg::Float64>("entropy", rclcpp::SystemDefaultsQoS());
     sst_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("map", rclcpp::SystemDefaultsQoS());
     sstm_ = this->create_publisher<nav_msgs::msg::MapMetaData>("map_metadata", rclcpp::SystemDefaultsQoS());
-    scan_filter_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::LaserScan>>
-            (node_, "scan", rclcpp::SensorDataQoS().get_rmw_qos_profile());
-//    sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-//        "scan", rclcpp::SensorDataQoS(),
-//        std::bind(&SlamGmapping::laserCallback, this, std::placeholders::_1));
-    scan_filter_ = std::make_shared<tf2_ros::MessageFilter<sensor_msgs::msg::LaserScan>>
-            (*scan_filter_sub_, *buffer_, odom_frame_, 10, node_);
-    scan_filter_->registerCallback(std::bind(&SlamGmapping::laserCallback, this, std::placeholders::_1));
+    // 【补丁】原版用 tf2_ros::MessageFilter 包装 /scan。它会在单线程执行器里
+    // 和 TF 回调形成自死锁：
+    //   setTransformImpl -> testTransformableRequests -> MessageFilter 的回调
+    //   -> 再次进入同一个 tf2 Buffer 抢同一把非递归锁 -> 永久冻结
+    // 症状：建图跑几分钟后彻底不动，/map 再也不发布，进程还活着、CPU 很低。
+    // 改回直连订阅（原文件第 193~195 行注释掉的写法就是对的），
+    // TF 查询放到 getOdomPose 里做非阻塞处理。
+    sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+        "scan", rclcpp::SensorDataQoS(),
+        std::bind(&SlamGmapping::laserCallback, this, std::placeholders::_1));
     transform_thread_ = std::make_shared<std::thread>
             (std::bind(&SlamGmapping::publishLoop, this, transform_publish_period_));
 }
@@ -140,13 +230,32 @@ bool SlamGmapping::getOdomPose(GMapping::OrientedPoint& gmap_pose, const rclcpp:
     centered_laser_pose_.header.stamp = t;
     // Get the laser's pose that is centered
     geometry_msgs::msg::PoseStamped odom_pose;
+    // 【补丁】原来用的是 buffer_->transform(..., durationFromSec(1.0))，
+    // 它会阻塞等待最长 1 秒。单线程执行器里这 1 秒内 TF 回调无法执行，
+    // 白白拖慢整个节点，极端情况下还会加重 tf2 的锁问题。
+    // 改成"先按扫描时间戳查，查不到立刻退回最新一帧"，全程零阻塞。
     try
     {
-        buffer_->transform(centered_laser_pose_, odom_pose, odom_frame_, tf2::durationFromSec(1.0));
+        geometry_msgs::msg::TransformStamped tf_msg;
+        try
+        {
+            tf_msg = buffer_->lookupTransform(
+                odom_frame_, centered_laser_pose_.header.frame_id,
+                tf2::timeFromSec(t.seconds()), tf2::durationFromSec(0.0));
+        }
+        catch (tf2::TransformException &)
+        {
+            // 该时刻的 TF 还没到（时序抖动），退回最新一帧
+            tf_msg = buffer_->lookupTransform(
+                odom_frame_, centered_laser_pose_.header.frame_id,
+                tf2::TimePointZero, tf2::durationFromSec(0.0));
+        }
+        tf2::doTransform(centered_laser_pose_, odom_pose, tf_msg);
     }
     catch(tf2::TransformException& e)
     {
-        RCLCPP_WARN(this->get_logger(), "Failed to compute odom pose, skipping scan (%s)", e.what());
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *get_clock(), 2000,
+                             "Failed to compute odom pose, skipping scan (%s)", e.what());
         return false;
     }
 
@@ -249,9 +358,17 @@ bool SlamGmapping::initMapper(const sensor_msgs::msg::LaserScan::ConstSharedPtr 
 
     GMapping::OrientedPoint gmap_pose(0, 0, 0);
 
-    // setting maxRange and maxUrange here so we can set a reasonable default
-    maxRange_ = scan->range_max - 0.01;
-    maxUrange_ = maxRange_;
+    // 【补丁】原版这里无条件覆盖：maxRange_ = scan->range_max - 0.01;
+    // 导致 yaml 里的 maxRange / maxUrange 永远被冲掉。改成：参数没设（<=0）才用默认值。
+    if (maxRange_ <= 0.0) {
+        maxRange_ = scan->range_max - 0.01;
+    }
+    if (maxUrange_ <= 0.0 || maxUrange_ > maxRange_) {
+        maxUrange_ = maxRange_;
+    }
+    RCLCPP_INFO(this->get_logger(),
+                "Range limits in use: maxRange=%.2f m  maxUrange=%.2f m  (laser range_max=%.2f)",
+                maxRange_, maxUrange_, scan->range_max);
 
     // The laser must be called "FLASER".
     // We pass in the absolute value of the computed angle increment, on the
@@ -354,8 +471,6 @@ void SlamGmapping::laserCallback(sensor_msgs::msg::LaserScan::ConstSharedPtr sca
     if ((laser_count_ % throttle_scans_) != 0)
         return;
 
-    tf2::TimePoint last_map_update = tf2::TimePointZero;
-
     // We can't initialize the mapper until we've got the first scan
     if(!got_first_scan_)
     {
@@ -381,10 +496,10 @@ void SlamGmapping::laserCallback(sensor_msgs::msg::LaserScan::ConstSharedPtr sca
         map_to_odom_mutex_.unlock();
 
         tf2::TimePoint timestamp = tf2_ros::fromMsg(scan->header.stamp);
-        if(!got_map_ || (timestamp - last_map_update) > map_update_interval_)
+        if(!got_map_ || (timestamp - last_map_update_) > map_update_interval_)
         {
             updateMap(scan);
-            last_map_update = tf2_ros::fromMsg(scan->header.stamp);
+            last_map_update_ = timestamp;
         }
     }
 }

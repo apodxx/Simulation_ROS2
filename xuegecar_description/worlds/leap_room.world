@@ -1,0 +1,171 @@
+<?xml version="1.0" ?>
+<!--
+  leap_room.world —— Leap 机器人 Gazebo 仿真场景
+
+  一个 8m x 6m 的房间，四周有墙，中间有 3 个障碍物。
+  为什么需要这个：Gazebo 默认的 empty.world 只有一块地面，
+  雷达扫出去全是 inf（什么都看不到），既不好看也没法验证 SLAM。
+
+  说明：地面和光照用内联定义，不依赖 model:// 在线模型库，避免联网下载。
+-->
+<sdf version="1.6">
+  <world name="leap_room">
+
+    <!-- 初始相机视角：位于房间西南角上方 1.05m，俯视 35° 看原点 -->
+    <gui fullscreen="0">
+      <camera name="user_camera">
+        <pose>-0.55 -0.48 0.42 0 0.52 0.72</pose>
+        <view_controller>orbit</view_controller>
+        <projection_type>perspective</projection_type>
+      </camera>
+    </gui>
+
+
+
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_update_rate>1000</real_time_update_rate>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- ==================== 地面 ==================== -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>100</mu>
+                <mu2>50</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <cast_shadows>false</cast_shadows>
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+          <material>
+            <script>
+              <uri>file://media/materials/scripts/gazebo.material</uri>
+              <name>Gazebo/Grey</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ==================== 光照 ==================== -->
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- ==================== 四面墙（房间 8m x 6m，墙高 1m）==================== -->
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0 -3.15 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>8.6 0.3 1.0</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>8.6 0.3 1.0</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Bricks</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_north">
+      <static>true</static>
+      <pose>0 3.15 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>8.6 0.3 1.0</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>8.6 0.3 1.0</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Bricks</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-4.15 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.3 6.6 1.0</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.3 6.6 1.0</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Bricks</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_east">
+      <static>true</static>
+      <pose>4.15 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.3 6.6 1.0</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.3 6.6 1.0</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Bricks</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ==================== 室内障碍物 ==================== -->
+    <model name="obstacle_box1">
+      <static>true</static>
+      <pose>1.5 0.8 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.8 0.8 0.5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.8 0.8 0.5</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Wood</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="obstacle_box2">
+      <static>true</static>
+      <pose>-1.8 -1.2 0.3 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.6 1.2 0.6</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.6 1.2 0.6</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Wood</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="obstacle_cylinder">
+      <static>true</static>
+      <pose>-2.5 1.8 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><cylinder><radius>0.35</radius><length>0.8</length></cylinder></geometry></collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.35</radius><length>0.8</length></cylinder></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Red</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>

@@ -7,8 +7,14 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 
+# launch/urdf/rviz/meshes/worlds 都是仿真和可视化需要的资源
 install(
-  DIRECTORY launch meshes rviz urdf
+  DIRECTORY launch meshes rviz urdf worlds
+  DESTINATION share/${PROJECT_NAME}
+)
+
+# model.config 让 Gazebo 能用 model://xuegecar_description/meshes/xxx.stl 找到网格
+install(FILES model.config
   DESTINATION share/${PROJECT_NAME}
 )
 
