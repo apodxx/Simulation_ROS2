@@ -308,3 +308,68 @@ fi
 ```
 
 实测：移动 0.3 m 后已知格子 929 → 5893（+4964），地图正常增长。
+
+---
+
+## 十一、保存地图失败（Failed to spin map subscription）
+
+**现象**：点"保存地图"后网页报错，或后端日志出现：
+
+```
+[ERROR] [map_saver]: Failed to spin map subscription
+[ros2run]: Process exited with failure 1
+```
+
+**根因**：`map_saver_cli` 默认只等 **2 秒** 就要收到一帧 `/map`。
+这台机器 DDS 发现较慢（尤其刚启动或节点较多时），2 秒内还没完成发现就超时退出了。
+
+所以它是**时好时坏**的：DDS 已经热了就成功，冷启动就失败。
+
+### 修复
+
+`server.js` 的 `/api/save_map` 里，给命令加上 ROS 参数：
+
+```js
+const wsSetup = '/home/nvidia/leap_ros_ws/install/setup.bash';
+const fullCommand = [
+  `mkdir -p "${saveDir}"`,
+  'source /opt/ros/humble/setup.bash',
+  `[ -f ${wsSetup} ] && source ${wsSetup} || true`,
+  'export ROS_DOMAIN_ID=0',
+  `${saveMapConfig.command} ${args.join(' ')} --ros-args -p save_map_timeout:=20.0`,
+].join(' && ');
+```
+
+三个要点：
+
+1. **`--ros-args -p save_map_timeout:=20.0`** —— 把等待时间从 2 秒延长到 20 秒（关键）
+2. **显式 `export ROS_DOMAIN_ID=0`** —— `spawn('bash', ['-c', ...])` 起的进程**不读 `.bashrc`**，
+   不显式设置就会用默认 domain，可能看不到 `/map`
+3. **source 工作空间的 setup.bash** —— 原来 source 的是 `/dev/null`（无意义）
+
+备份：`server.js.bak_savemap`
+
+### 验证
+
+```bash
+# 连续保存 3 次，应全部成功
+for i in 1 2 3; do
+  curl -s -X POST http://localhost:3000/api/save_map \
+    -H "Content-Type: application/json" \
+    -d "{\"mapName\":\"test_$i\"}" | head -c 150; echo
+done
+```
+
+实测：3/3 全部成功，每次生成约 16 KB 的 `.pgm` + `.yaml`。
+
+### 命令行手动保存（同样需要超时参数）
+
+```bash
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=0
+ros2 run nav2_map_server map_saver_cli -f <路径/地图名> \
+  --ros-args -p save_map_timeout:=20.0
+```
+
+> 注意：`map_saver_cli` **没有 `-t` 这个命令行参数**，必须用 ROS 参数形式
+> `--ros-args -p save_map_timeout:=20.0`。
