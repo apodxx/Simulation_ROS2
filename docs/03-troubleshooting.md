@@ -20,6 +20,7 @@
 | `map_saver_cli` 报 Failed to spin map subscription | [13](#13-存地图失败) |
 | 脚本一运行就退出，报 unbound variable | [14](#14-set-u-与-ros-setupbash-冲突) |
 | `ros2 node list` / `ros2 lifecycle get` 查不到节点 | [15](#15-dds-发现慢导致查不到节点) |
+| 网页打得开但没有数据 / 提示连不上小车 | [16](#16-网页连不上小车后端在跑但页面空) |
 
 ---
 
@@ -409,6 +410,109 @@ ros2 topic info /amcl_pose      # Publisher count: 1 → 正常
 ```
 
 同理，`/cmd_vel` 的发布者数量在被杀进程后会**短暂虚高**（DDS 僵尸端点），约 20~60 秒自行消失。真正要看的是话题有没有数据。
+
+---
+
+## 16. 网页"连不上小车"（后端在跑但页面空）
+
+### 症状
+
+- `http://<Jetson-IP>:5173/` 能打开，页面框架正常
+- 但地图空白、没有雷达点、显示"未连接"/"连不上小车"
+- 直觉会以为是小车掉线了
+
+### 关键判据：先分清是"车的问题"还是"桥的问题"
+
+网页的数据链路是三段串联，任何一段断了页面都是空的：
+
+```
+小车 ──micro-ROS/UDP──> Jetson(ROS2) ──foxglove_bridge:8765──> 网页
+```
+
+按这三层逐一确认：
+
+```bash
+# 第一层：小车在线吗（ROS 话题有没有数据）
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=0
+ros2 topic hz /scan      # 有 ~8 Hz → 车和 micro-ROS 都好
+ros2 topic hz /odom      # 有 ~40 Hz
+ros2 topic hz /map       # 建图时 ~2 Hz
+
+# 第二层：数据桥接在吗（这一层最容易挂）
+pgrep -cf foxglove_bridge        # 应为 2；是 0 就是它挂了
+ss -tln | grep 8765              # 必须 LISTEN
+
+# 第三层：后端和页面
+ss -tln | grep -E ':3000|:5173'
+```
+
+**如果第一层有数据、第二层是 0，那就是数据桥接丢了，小车本身完全正常。**
+
+### 根因：foxglove_bridge 是 node server.js 的子进程
+
+`foxglove_bridge` 由后端的 startup 任务拉起，是 `node server.js` 的**子进程**。
+所以一旦你：
+
+- 单独 `pkill -f 'node server.js'` 然后重启后端
+- 只重启了后端而没重新触发 startup 任务
+- 机器重启后只手动起了后端
+
+`foxglove_bridge` 就一起被杀掉且**不会自动回来** —— 于是 ROS 数据明明在全速流动，页面却一片空白。
+
+### 修复：后端末尾的自愈看门狗
+
+`/home/nvidia/robot/Ros_Vue_arm/server.js` 文件末尾追加了一段 watchdog：
+后端启动 5 秒后自己 `POST /api/run_task/startup`，把 `foxglove_bridge` 拉起来。
+
+```js
+// AUTO_STARTUP_WATCHDOG：后端重启后自动拉起 startup 任务（foxglove_bridge）
+setTimeout(async () => {
+    try {
+        const res = await fetch('http://127.0.0.1:3000/api/run_task/startup', { method: 'POST' });
+        console.log('[watchdog] 已触发 startup 任务，HTTP', res.status);
+    } catch (e) {
+        console.error('[watchdog] 触发失败:', e.message);
+    }
+}, 5000);
+```
+
+**两个坑，改 server.js 时务必注意：**
+
+1. **这个文件是 ESM**（`package.json` 里有 `"type": "module"`），
+   不能用 `require('http')`，否则运行时崩 `ReferenceError: require is not defined`。
+   要用 Node 内置的全局 `fetch`（Node 18+ 可用，Jetson 上是 v22）。
+2. **不要把代码插进 `app.listen(port, () => {...})` 的回调体内部** ——
+   用 `find('});')` 找闭合括号会命中回调里嵌套的 `});`，
+   直接导致 `SyntaxError: Unexpected end of input`。
+   **追加到文件最末尾**最安全。
+
+改完**先验证语法再重启**，否则你会把后端也搞挂：
+
+```bash
+node --check /home/nvidia/robot/Ros_Vue_arm/server.js &&   pkill -f 'node server.js'; cd /home/nvidia/robot/Ros_Vue_arm;   nohup setsid node server.js > /tmp/server.log 2>&1 < /dev/null &
+```
+
+### 已验证自愈
+
+```bash
+pkill -f foxglove_bridge                  # 手动杀掉桥
+pgrep -cf foxglove_bridge                 # 0
+pkill -f 'node server.js'; nohup setsid node server.js ... &   # 重启后端
+sleep 25
+pgrep -cf foxglove_bridge                 # 2   ← 自动回来
+ss -tln | grep 8765                       # LISTEN
+```
+
+### 手动兜底（看门狗万一失效）
+
+不用重启后端，直接让后端跑一次 startup 任务：
+
+```bash
+curl -X POST http://localhost:3000/api/run_task/startup
+sleep 5
+pgrep -cf foxglove_bridge    # 2
+```
 
 ---
 
