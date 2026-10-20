@@ -1,0 +1,74 @@
+/slam_gmapping:
+  ros__parameters:
+    # ================= 真车实机配置（use_sim_time: false）=================
+    base_frame: base_footprint
+    map_frame: map
+    odom_frame: odom
+
+    # 仿真里必须用仿真时钟，否则 map->odom 的 TF 会打在墙钟时间上，
+    # 和里程计 TF(仿真时间) 混在一棵树里，RViz 定位就会错。
+    use_sim_time: false
+
+    # ================= 更新阈值（越小越频繁做扫描匹配，越不容易漂）=================
+    linearUpdate: 0.2        # 走 20cm 就处理一帧（原写死 1.0m，走 1 米才匹配一次）
+    angularUpdate: 0.2       # 转 11.5° 就处理一帧（原写死 0.5rad=28.6°）
+    temporalUpdate: 0.5      # 停着不动时也每秒处理一帧，地图不会"冻结"
+    resampleThreshold: 0.5
+
+    # ================= 粒子滤波 / 扫描匹配 =================
+    particles: 40            # 原 30；墙角这种退化场景 30 个粒子权重完全分不开(neff=29.96/30)
+    iterations: 10           # 原 5；扫描匹配迭代次数，越大越准也越慢
+    kernelSize: 1
+    lskip: 0
+    sigma: 0.05
+    lsigma: 0.075
+    ogain: 3.0
+    lstep: 0.05
+    astep: 0.05
+    llsamplerange: 0.01
+    llsamplestep: 0.01
+    lasamplerange: 0.005
+    lasamplestep: 0.005
+    minimum_score: 0.0
+
+    # ================= 运动模型噪声 =================
+    # 仿真里 Gazebo 的轮式里程计几乎是准的(实测 odom 与真值误差 <1mm)，
+    # 所以把噪声调小 = 更相信里程计 = 粒子不会乱跑。
+    srr: 0.01
+    srt: 0.02
+    str: 0.01
+    stt: 0.02
+
+    # ================= 地图网格 =================
+    delta: 0.05
+    xmin: -10.0
+    xmax: 10.0
+    ymin: -10.0
+    ymax: 10.0
+    occ_thresh: 0.25
+
+    # ================= 激光使用范围 =================
+    # maxRange  : 超过这个距离的激光点直接丢弃
+    # maxUrange : 参与"扫描匹配"的最大距离，必须 <= maxRange
+    # <=0 则自动使用激光器自身的 range_max
+    maxRange: 12.0
+    maxUrange: 8.0
+
+    # ================= 其他 =================
+    map_update_interval: 1.0
+    transform_publish_period: 0.05
+    throttle_scans: 1
+
+    qos_overrides:
+      /parameter_events:
+        publisher:
+          depth: 1000
+          durability: volatile
+          history: keep_all
+          reliability: reliable
+      /tf:
+        publisher:
+          depth: 1000
+          durability: volatile
+          history: keep_last
+          reliability: reliable
