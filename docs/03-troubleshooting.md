@@ -22,6 +22,7 @@
 | `ros2 node list` / `ros2 lifecycle get` 查不到节点 | [15](#15-dds-发现慢导致查不到节点) |
 | 网页打得开但没有数据 / 提示连不上小车 | [16](#16-网页连不上小车后端在跑但页面空) |
 | 掉头时地图里多出一条不存在的通道 | [17](#17-掉头时地图出现假通道角速度过快) |
+| 页面只有红色激光点、没有黑白地图 | [18](#18-只有红色激光点没有黑白地图odom-tf-缺失) |
 
 ---
 
@@ -610,6 +611,144 @@ ros2 topic echo /cmd_vel --field angular.z
    `gyro_yaw_sign` 要用 **+1.0**）。它会把 odom 完全重建并清零起点，
    **重启时 SLAM 必须一起重启**。这条路能消除滑移带来的所有误差，
    但改动更大，建议先靠限速跑通再考虑。
+
+---
+
+## 18. 只有红色激光点、没有黑白地图（odom TF 缺失）
+
+### 症状
+
+网页 3D 面板里能看到红色的激光点，但**从来没有黑白栅格地图**。
+点云看起来是碎成一段一段的，地图区域一片空白。
+
+### 关键判据
+
+```bash
+export ROS_DOMAIN_ID=0
+ros2 topic hz /scan      # 有 ~9 Hz  → 小车和 micro-ROS 都正常
+ros2 topic hz /map       # 没有数据 → SLAM 根本没在出图
+```
+
+再看 slam_toolbox 日志，会看到它**把每一帧激光都丢了**：
+
+```
+[slam_toolbox]: Message Filter dropping message: frame 'laser_frame'
+  at time 1792487920.479 for reason 'discarding message because the queue is full'
+```
+
+### 根因：`odom -> base_footprint` 这条 TF 没人发
+
+slam_toolbox 要把激光从 `laser_frame` 变换到 `odom` 才能做扫描匹配。
+这条链是：
+
+```
+map --(slam_toolbox)--> odom --(xuegecar_bringup)--> base_footprint --(URDF)--> laser_frame
+```
+
+中间 `odom -> base_footprint` 由 **`xuegecar_bringup`** 节点发布
+（订阅 `/odom`，用 `TransformBroadcaster` 发出去）。
+**这条一断，后面全崩**：MessageFilter 拿不到变换，消息堆积到队列上限后全部丢弃，
+`/map` 永远没有内容。而且 `map -> odom` 也不会出现（slam_toolbox 没有匹配结果）。
+
+验证：
+
+```bash
+ros2 topic echo /tf --once | grep -E 'frame_id|child_frame_id'
+# 正常应能看到 odom -> base_footprint
+# 只有 base_link -> left_wheel_link / right_wheel_link 就是这条断了
+```
+
+### 为什么特别难查：进程活着，但它死了
+
+这次踩到的是一个非常阴险的状态：
+
+| 检查项 | 结果 |
+|---|---|
+| `ps` 能看到进程 | ✅ 在，已运行 6 小时 |
+| CPU 占用 | ✅ 22%，满速空转（还在 1000 Hz 发 TF） |
+| `ros2 node list` | ❌ **看不到它** |
+| `ros2 topic info /odom` 的订阅者 | ❌ 只有 foxglove，没有它 |
+| `kill`（SIGTERM） | ❌ **杀不掉**，卡在 `futex_wait_queue_me` |
+| `kill -9` | ✅ 才杀得掉 |
+
+也就是说：**Fast-DDS 的 participant 已经损坏，进程在空转但一条消息都发不出去**。
+配套的症状是启动时满屏的：
+
+```
+[RTPS_TRANSPORT_SHM Error] Failed init_port fastrtps_port7419: open_and_lock_file failed
+```
+
+**所以判断"TF 在不在"绝对不能只看进程有没有在跑。**
+
+### 修复
+
+```bash
+# 1. 必须 kill -9（SIGTERM 无效）
+pkill -9 -f 'xuegecar_bringup'
+sleep 3
+
+# 2. 重新起（注意 source 自家工作空间，包不在 /opt/ros 里）
+source /opt/ros/humble/setup.bash
+source /home/nvidia/leap_ros_ws/install/setup.bash
+setsid nohup ros2 run xuegecar_bringup xuegecar_bringup \
+  > /home/nvidia/robot/logs/bringup.log 2>&1 < /dev/null &
+
+# 3. 验证订阅者应该变成 2（foxglove + bringup）
+sleep 8
+ros2 topic info /odom | grep 'Subscription count'
+
+# 4. 重启建图
+curl -X POST http://localhost:3000/api/start_mapping
+```
+
+TF 一通，slam_toolbox **立刻**开始发布 `map -> odom`，`/map` 马上就有内容 —— 不用等。
+
+### 已做的加固：`task_mapping.sh` 自带守护
+
+`/home/nvidia/robot/task_mapping.sh` 在启动 slam 之前会检查 TF，不通就强制重启：
+
+```bash
+TFOK=$(timeout 8 ros2 topic echo /tf --once 2>/dev/null | grep -c "base_footprint")
+if ! pgrep -f "xuegecar_bringup/lib/xuegecar_bringup" >/dev/null 2>&1 || [ "${TFOK:-0}" -eq 0 ]; then
+  pkill -9 -f "xuegecar_bringup"
+  ...启动...
+fi
+```
+
+**判据刻意用的是"TF 通不通"而不是"进程在不在"** —— 因为这次就是进程在、TF 不通。
+
+同时脚本里加了 `source /home/nvidia/leap_ros_ws/install/setup.bash`，
+否则 `ros2 run xuegecar_bringup` 会报 `Package not found`。
+
+### 附带优化：TF 从 1000 Hz 降到 50 Hz
+
+`xuegecar_bringup.cpp` 原来是：
+
+```cpp
+rclcpp::WallRate loop_rate(1000.0);   // 实测 6 秒发出 4718 条 TF
+```
+
+改成 50 Hz（激光才 10 Hz，完全够用）。实测各变换频率变为：
+
+| 变换 | 频率 |
+|---|---|
+| `odom -> base_footprint` | 31 Hz |
+| `map -> odom` | 26 Hz |
+| `base_link -> *_wheel_link` | 10 Hz |
+
+1000 Hz 的 TF 会白白灌满 DDS、并把海量数据推给浏览器，
+是 Fast-DDS participant 反复损坏和网页卡顿的元凶之一。
+
+### 顺手清理：重复的 joint_state_publisher
+
+`task_mapping.sh` 每次被触发都会重启节点，反复刷新页面会积累出多个
+`joint_state_publisher`（实测堆到 4 个）。查一下：
+
+```bash
+pgrep -cf joint_state_publisher   # 大于 1 就该清理
+```
+
+只留一个即可（`base_link -> wheel_link` 的 TF 靠它驱动）。
 
 ---
 

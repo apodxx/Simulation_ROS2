@@ -59,7 +59,10 @@ int main(int argc, char **argv)
   /*产生一个的节点*/
   auto node = std::make_shared<TopicSubscribe01>("xuegecar_bringup");
   /* 运行节点，并检测退出信号*/
-  rclcpp::WallRate loop_rate(1000.0);
+  // 原为 1000 Hz —— 实测 6 秒发出 4718 条 /tf，白白灌满 DDS 并让
+  // foxglove_bridge 把海量 TF 推给浏览器，是之前 DDS participant 反复
+  // 损坏、网页卡顿的元凶之一。激光才 10 Hz，50 Hz 完全够用。
+  rclcpp::WallRate loop_rate(50.0);
   while (rclcpp::ok())
   {
     rclcpp::spin_some(node);
