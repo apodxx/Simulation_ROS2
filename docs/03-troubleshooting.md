@@ -21,6 +21,7 @@
 | 脚本一运行就退出，报 unbound variable | [14](#14-set-u-与-ros-setupbash-冲突) |
 | `ros2 node list` / `ros2 lifecycle get` 查不到节点 | [15](#15-dds-发现慢导致查不到节点) |
 | 网页打得开但没有数据 / 提示连不上小车 | [16](#16-网页连不上小车后端在跑但页面空) |
+| 掉头时地图里多出一条不存在的通道 | [17](#17-掉头时地图出现假通道角速度过快) |
 
 ---
 
@@ -513,6 +514,102 @@ curl -X POST http://localhost:3000/api/run_task/startup
 sleep 5
 pgrep -cf foxglove_bridge    # 2
 ```
+
+---
+
+## 17. 掉头时地图出现假通道（角速度过快）
+
+### 症状
+
+建图过程中做一次急掉头，回到原处后发现地图上**凭空多出一条走廊/通道**，
+或者同一堵墙变成两堵平行墙。慢慢开、小角度转弯时一切正常。
+
+### 机制（这不是玄学，是可复现的物理链路）
+
+```
+角速度太大 → 轮子打滑 → 编码器少算转角 → /odom 的 yaw 偏小
+           → SLAM 的扫描匹配找不到正确解 → 把墙"掰"成两堵 → 假通道
+```
+
+关键数字来自真车实测：
+
+| 场景 | 固件 `/odom` yaw | 陀螺仪实测 | 误差 |
+|---|---|---|---|
+| 直行 1 m | +70.3° | +2.0° | 轮速差积分根本不适合算 yaw |
+| **急掉头** | **−79.4°** | **−156.3°** | **少报了将近一半** |
+
+而 `slam_toolbox.yaml` 里的搜索窗口是：
+
+```yaml
+coarse_search_angle_offset: 0.349   # = 20°,扫描匹配允许的最大角度误差
+```
+
+掉头时 odom 误差远大于 ±20°，匹配器在这个窗口内**找不到正确解**，
+只能吸附到某个错误的局部最优 —— 于是把一堵墙匹配成了两堵。
+
+另外，2D 雷达扫一整圈需要时间，车在转的时候每个点采集时的车体朝向都不同，
+转速越快**单帧点云畸变**越严重，会进一步加重错配。三个因素指向同一个结论：**转弯要慢**。
+
+### 修复：限速 + 变化率斜坡
+
+单纯限最大值不够 —— 摇杆从 0 一甩到底，起步瞬间照样打滑。
+所以前端（`/home/nvidia/robot/Ros_Vue_arm`）做了两道限制：
+
+**① 绝对上限**
+
+| 位置 | 参数 | 原值 | 现值 |
+|---|---|---|---|
+| `src/components/JoystickControl.vue` | `maxAngularSpeed` | 1.0 rad/s | **0.45 rad/s** |
+| `src/components/JoystickControl.vue` | `maxLinearSpeed` | 0.5 m/s | **0.40 m/s** |
+| `src/App.vue`（键盘） | `MAX_ANGULAR_VEL` | 0.8 rad/s | **0.45 rad/s** |
+| `src/App.vue`（安全层） | `SAFE_MAX_ANGULAR` | 无 | **0.45 rad/s** |
+| `src/App.vue`（安全层） | `SAFE_MAX_LINEAR` | 无 | **0.40 m/s** |
+
+**② 变化率斜坡**（`App.vue` 的 `SAFE_ANGULAR_ACC = 1.2 rad/s²`）
+
+```js
+const SAFE_ANGULAR_ACC = 1.2   // rad/s^2 角速度变化率上限（越小越柔和）
+```
+
+所有速度指令（摇杆 + 键盘 + 急停）统一走 `sendVelocitySafe()` 这一个出口，
+它先钳幅、再按 `SAFE_ANGULAR_ACC * dt` 逐步逼近目标值。
+从 0 加到 0.45 rad/s 大约需要 0.4 秒，轮子不会因为阶跃指令而打滑。
+
+急停走 `immediate` 分支**绕开斜坡**，保证松手立刻停住。
+
+> 注意：不要再在别处直接调 `foxglove.sendTwist()`，否则会绕过安全层。
+
+**③ Nav2 侧对齐**（`/home/nvidia/robot/config/nav2.yaml`）
+
+导航时虽然不建图，但 AMCL 同样依赖 odom，角速度过大会拖坏定位：
+
+| 参数 | 原值 | 现值 |
+|---|---|---|
+| `FollowPath.max_vel_theta` | 0.8 | **0.5** |
+| `FollowPath.acc_lim_theta` | 3.2 | **1.5** |
+| `rotation_shim.max_rotational_vel` | 1.0 | **0.5** |
+| `velocity_smoother.max_velocity`（角） | 1.0 | **0.5** |
+
+### 验证限速是否真的生效
+
+改完前端刷新页面即可（Vite 有 HMR，不用重启）。然后看实际下发的角速度：
+
+```bash
+export ROS_DOMAIN_ID=0
+ros2 topic echo /cmd_vel --field angular.z
+# 把摇杆推到底，读数不应超过 0.45
+```
+
+### 还会触发怎么办
+
+1. **先确认斜坡没被绕过** —— 有没有别的代码在直接调 `foxglove.sendTwist`
+2. **再降 `SAFE_MAX_ANGULAR`** —— 0.45 → 0.35 一般就非常稳了
+3. **改用弧线掉头** —— 边走边转（两轮同向滚动）比原地急转更不容易打滑
+4. **根治：用陀螺仪替代轮速差算 yaw**
+   `/home/nvidia/robot/gyro_odom_fixer.py` 就是干这个的（micro-ROS 路径下
+   `gyro_yaw_sign` 要用 **+1.0**）。它会把 odom 完全重建并清零起点，
+   **重启时 SLAM 必须一起重启**。这条路能消除滑移带来的所有误差，
+   但改动更大，建议先靠限速跑通再考虑。
 
 ---
 
