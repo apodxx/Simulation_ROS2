@@ -433,17 +433,20 @@ bool SlamGmapping::addScan(const sensor_msgs::msg::LaserScan::ConstSharedPtr sca
         RCLCPP_DEBUG(this->get_logger(), "Inverting scan");
         int num_ranges = static_cast<int>(scan->ranges.size());
         for (int i = 0; i < num_ranges; i++) {
-            // Must filter out short readings, because the mapper won't
+            // 【补丁】无效读数（真车雷达用 0.000 表示）不能替换成 range_max，
+            // 否则 gmapping 会沿着那条射线清空 maxRange 那么远，
+            // 在墙上"开辟"出根本不存在的通道。用一个超过 maxRange 的哨兵值，
+            // gmapping 会直接忽略该射线（既不清理也不标障碍）。
             if (scan->ranges[num_ranges - i - 1] < scan->range_min)
-                ranges_double[i] = (double) scan->range_max;
+                ranges_double[i] = (double) (maxRange_ + 1.0);
             else
                 ranges_double[i] = (double) scan->ranges[num_ranges - i - 1];
         }
     } else {
         for (unsigned int i = 0; i < scan->ranges.size(); i++) {
-            // Must filter out short readings, because the mapper won't
+            // 【补丁】同上：无效读数用超过 maxRange 的哨兵值，让 gmapping 忽略该射线
             if (scan->ranges[i] < scan->range_min)
-                ranges_double[i] = (double) scan->range_max;
+                ranges_double[i] = (double) (maxRange_ + 1.0);
             else
                 ranges_double[i] = (double) scan->ranges[i];
         }

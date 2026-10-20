@@ -33,12 +33,20 @@ else
   grep -q 'create_client' /tmp/agent.log 2>/dev/null || echo "    ⚠️ 小车未连接，检查小车配置页的 agent IP 是否为 $(hostname -I | awk '{print $1}')"
 fi
 
-echo "==> 3/4 启动底盘（robot_state_publisher + xuegecar_bringup）"
+echo "==> 3/5 启动陀螺里程计修正（修复掉头打滑导致的 yaw 虚报）"
+pkill -f gyro_odom_fixer 2>/dev/null || true
+sleep 1
+nohup setsid python3 /home/nvidia/robot/gyro_odom_fixer.py \
+  --ros-args -p odom_in:=/odom -p odom_out:=/odom_fixed -p gyro_yaw_sign:=1.0 \
+  > /tmp/fixer.log 2>&1 &
+sleep 4
+
+echo "==> 4/5 启动底盘（使用 /odom_fixed 生成 TF）"
 : > /tmp/bringup.log
-nohup setsid ros2 launch xuegecar_bringup xuegecar_bringup.launch.py > /tmp/bringup.log 2>&1 &
+nohup setsid ros2 launch xuegecar_bringup xuegecar_bringup_real.launch.py > /tmp/bringup.log 2>&1 &
 sleep 8
 
-echo "==> 4/4 状态自检"
+echo "==> 5/5 状态自检"
 echo -n "    /odom  : "; timeout 10 ros2 topic hz /odom 2>&1 | grep -m1 'average rate' || echo "无数据"
 echo -n "    /scan  : "; timeout 10 ros2 topic hz /scan 2>&1 | grep -m1 'average rate' || echo "无数据"
 echo -n "    电池   : "; timeout 8 ros2 topic echo /battery_state --once --field percentage 2>/dev/null || echo "无数据"

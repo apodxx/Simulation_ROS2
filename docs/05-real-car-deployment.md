@@ -311,3 +311,97 @@ ros2 run tf2_ros tf2_echo map base_footprint
 | agent 会话反复掉线 | 关相机、降低 gmapping 粒子数 |
 | 车不动 | 检查超声波是否触发 `obstacle: true`；确认前方 0.35 m 以上 |
 | gmapping 卡住不初始化 | 确认用的是 `slam_gmapping_real.launch.py`（`use_sim_time: false`） |
+
+---
+
+## 十、掉头时地图出现"假通道"（两个关键 bug）
+
+**现象**：小车掉头（U-turn）后，SLAM 在地图上"开辟"出一段根本不存在的通道 / 走廊。
+
+这是两个独立 bug 叠加的结果，都已修复。
+
+### Bug 1：无效激光读数被当成 12 米距离
+
+`addScan()` 原文：
+
+```cpp
+// Must filter out short readings
+if (scan->ranges[i] < scan->range_min)
+    ranges_double[i] = (double) scan->range_max;    // ← 变成 12 米！
+```
+
+真车雷达用 **0.000 表示无效读数**，每帧约 28 个。它们被替换成 `range_max`（12 m）后，
+gmapping 会沿着这些射线**清空 12 米** —— 直接在墙上开出一条假通道。
+
+仿真里没这个问题，是因为 Gazebo 雷达的 `range_min` 被设为 0.25 后从不产生无效值。
+
+**修复**：改成用超过 `maxRange` 的哨兵值，gmapping 会直接忽略该射线（既不清理也不标障碍）：
+
+```cpp
+if (scan->ranges[i] < scan->range_min)
+    ranges_double[i] = (double) (maxRange_ + 1.0);   // 超过 maxRange → 忽略
+```
+
+**效果对比（同样的短距离建图）**：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 已知面积 | **123.8 m²** | **26.9 m²** |
+| 障碍占比 | 1.3% | **7.7%** |
+
+已知面积降到 1/5，虚空的假通道消失，墙线才显现出来。
+
+### Bug 2：固件 `/odom` 的 yaw 在打滑时虚报数倍
+
+固件的 `motion_controller.cpp` 里 yaw 是**左右轮速差积分**：
+
+```cpp
+odom_yaw_ += local_vw * dt;   // local_vw = (右轮 - 左轮) / kTrackWidth
+```
+
+打滑时虚报严重。本项目实测数据：
+
+| 场景 | 指令 | 固件 `/odom` 报告 | 陀螺积分 |
+|---|---|---|---|
+| **直线行驶 1 米** | 直行 0.15 m/s | **+70.3°**（应≈0） | +2.0° |
+| 掉头 | 180° | −79.4° | −156.3° |
+| 原地旋转 3 秒 | 0.4 rad/s | +68.3° | +17.5°（实际被卡住只转了这么多） |
+
+**直线行驶漂 70°** —— 这是地图被毁的根本原因。
+
+**修复**：用厂商的 `gyro_odom_fixer.py`，用 IMU 陀螺角速度积分替换 yaw：
+
+```bash
+python3 /home/nvidia/robot/gyro_odom_fixer.py \
+  --ros-args -p odom_in:=/odom -p odom_out:=/odom_fixed -p gyro_yaw_sign:=1.0
+```
+
+> ⚠️ **`gyro_yaw_sign` 必须是 `+1.0`**（不是文件里默认的 `-1.0`）。
+> 厂商那套是给 `xuegecar_mavlink_bridge` 路径调的，micro-ROS 路径的陀螺 z 轴方向相反。
+
+然后让底盘 bringup 用修正后的里程计：
+
+```bash
+ros2 launch xuegecar_bringup xuegecar_bringup_real.launch.py
+```
+
+这个 launch 里做了重映射：`remappings=[('odom', '/odom_fixed')]`
+
+> **注意**：`gyro_odom_fixer` 是**完全重建**里程计（从 twist + 陀螺积分，起点清零），
+> 所以每次重启 fixer 都会让 odom 回到原点 —— **必须同时重启 gmapping**。
+
+### 修复后的完整启动顺序
+
+```bash
+# 1. micro-ROS agent
+ros2 run micro_ros_agent micro_ros_agent udp4 --port 8888 -v4 &
+# 2. 陀螺里程计修正
+python3 ~/robot/gyro_odom_fixer.py --ros-args \
+  -p odom_in:=/odom -p odom_out:=/odom_fixed -p gyro_yaw_sign:=1.0 &
+# 3. 底盘（用修正后的 odom）
+ros2 launch xuegecar_bringup xuegecar_bringup_real.launch.py &
+# 4. SLAM
+ros2 launch slam_gmapping slam_gmapping_real.launch.py &
+```
+
+`scripts/start_real.sh` 已按此顺序封装。
