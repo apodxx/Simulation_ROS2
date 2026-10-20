@@ -219,7 +219,7 @@ Gazebo 的 `diff_drive` 插件会**锁存最后一条速度指令**。如果直�
 | [docs/02-parameters.md](docs/02-parameters.md) | 所有参数的含义、默认值、改动理由 |
 | [docs/03-troubleshooting.md](docs/03-troubleshooting.md) | 12 个真实踩过的坑与排查流程 |
 | **[docs/05-real-car-deployment.md](docs/05-real-car-deployment.md)** | **真车部署（Jetson Orin NX + micro-ROS）** |
-| **[docs/06-web-console.md](docs/06-web-console.md)** | **网页中控台部署（浏览器遥控小车）** |
+| **[docs/06-web-console.md](docs/06-web-console.md)** | **网页中控台部署（含建图不更新的排查）** |
 
 ---
 

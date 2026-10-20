@@ -232,3 +232,79 @@ UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable --now robot-console
 ```
+
+---
+
+## 十、重要：建图前必须有完整的里程计链
+
+点"开始建图"后地图不更新，最常见的**不是 SLAM 的问题**，而是里程计 TF 链断了。
+
+### 必需的四个环节
+
+```
+小车 /odom ──► gyro_odom_fixer ──► /odom_fixed ──► xuegecar_bringup ──► odom→base_footprint TF
+                                                                              │
+                                                    slam_toolbox ◄────────────┘
+                                                          │
+                                                          ▼
+                                                   /map（地图）
+```
+
+| 环节 | 缺了会怎样 |
+|---|---|
+| `gyro_odom_fixer` | `/odom_fixed` 无发布者 → 底盘 bringup 收不到里程计 → **没有任何 TF** |
+| `xuegecar_bringup_real` | `odom→base_footprint` 不存在 → slam_toolbox 拿不到位姿 → **地图冻结** |
+| `robot_state_publisher` | `base_footprint→laser_frame` 不存在 → 扫描无法变换 → **丢帧** |
+| `slam_toolbox` / `slam_gmapping` | 没有 `/map` |
+
+### 诊断命令
+
+```bash
+export ROS_DOMAIN_ID=0
+for t in /odom_fixed /scan /map; do
+  printf "%-14s " $t; ros2 topic hz $t 2>&1 | grep -m1 'average rate'
+done
+# /odom_fixed 应该有值；如果没值 → gyro_odom_fixer 没跑
+
+ros2 run tf2_ros tf2_echo odom base_footprint   # 应该能拿到
+ros2 run tf2_ros tf2_echo map base_footprint    # 应该能拿到
+```
+
+> ⚠️ `tf2_echo` 启动时会有几秒的 `does not exist`，那是新节点的 DDS 发现延迟，**不代表 TF 真的缺失**。
+> 判定时建议用 Python 脚本等待发现，或看 `/tf` 的实际内容：
+> `ros2 topic echo /tf --once | grep child_frame_id`
+
+### 本次修复
+
+`task_mapping.sh` 原来只重启 `slam_toolbox` 和 `robot_state_publisher`，
+**不会拉起 `gyro_odom_fixer` 和底盘 bringup**，所以只要 fixer 停过，点"开始建图"就是坏的。
+
+已在其启动 `slam_toolbox` 之前加入两段检查：
+
+```bash
+# 确保 gyro_odom_fixer 在跑
+if ! pgrep -f gyro_odom_fixer >/dev/null 2>&1; then
+  setsid nohup python3 /home/nvidia/robot/gyro_odom_fixer.py \
+    --ros-args -p odom_in:=/odom -p odom_out:=/odom_fixed -p gyro_yaw_sign:=1.0 \
+    > $R/logs/fixer.log 2>&1 < /dev/null &
+  sleep 4
+fi
+
+# 确保底盘 bringup 在跑（用 /odom_fixed）
+if ! pgrep -f 'lib/xuegecar_bringup/xuegecar_bringup' >/dev/null 2>&1; then
+  setsid nohup ros2 launch xuegecar_bringup xuegecar_bringup_real.launch.py \
+    > $R/logs/bringup.log 2>&1 < /dev/null &
+  sleep 6
+fi
+```
+
+备份：`task_mapping.sh.bak_fixer`
+
+### 验证方法
+
+```bash
+# 移动小车 0.3 m，看地图已知格子数是否增长
+# 正常应该从几百增长到几千
+```
+
+实测：移动 0.3 m 后已知格子 929 → 5893（+4964），地图正常增长。
